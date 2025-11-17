@@ -32,6 +32,14 @@ Boards
 Device Drivers and Devicetree
 *****************************
 
+QSPI
+===
+
+* :dtcompatible:`st,stm32-qspi` compatible nodes configured with ``dual-flash`` property
+  now need to also include the ``ssht-enable`` property to reenable sample shifting.
+  Sample shifting is configurable now and disabled by default.
+  (:github:`98999`).
+
 Bluetooth
 *********
 
@@ -43,6 +51,13 @@ Other subsystems
 
 Modules
 *******
+
+Trusted Firmware-M
+==================
+
+* The ``SECURE_UART1`` TF-M define is now controlled by Zephyr's
+  :kconfig:option:`CONFIG_TFM_SECURE_UART`. This option will override any platform values previously
+  specified in the TF-M repository.
 
 Architectures
 *************
