@@ -33,3 +33,34 @@ tests:
       - esp32s3_devkitc/esp32s3/procpu
       - esp32c3_devkitc
       - esp8684_devkitm
+  esp.wifi.pmksa_import:
+    build_only: true
+    tags: wifi
+    filter: CONFIG_WIFI_ESP32
+    extra_configs:
+      - CONFIG_BUILD_ONLY_NO_BLOBS=y
+      - CONFIG_ESP32_WIFI_ENTERPRISE=y
+      - CONFIG_WIFI_MGMT_PMKSA_IMPORT=y
+    platform_allow:
+      - esp32c6_devkitc/esp32c6/hpcore
+  esp.wifi.pmksa_export:
+    build_only: true
+    tags: wifi
+    filter: CONFIG_WIFI_ESP32
+    extra_configs:
+      - CONFIG_BUILD_ONLY_NO_BLOBS=y
+      - CONFIG_ESP32_WIFI_ENTERPRISE=y
+      - CONFIG_WIFI_MGMT_PMKSA_EXPORT=y
+    platform_allow:
+      - esp32c6_devkitc/esp32c6/hpcore
+  esp.wifi.pmksa_import_export:
+    build_only: true
+    tags: wifi
+    filter: CONFIG_WIFI_ESP32
+    extra_configs:
+      - CONFIG_BUILD_ONLY_NO_BLOBS=y
+      - CONFIG_ESP32_WIFI_ENTERPRISE=y
+      - CONFIG_WIFI_MGMT_PMKSA_IMPORT=y
+      - CONFIG_WIFI_MGMT_PMKSA_EXPORT=y
+    platform_allow:
+      - esp32c6_devkitc/esp32c6/hpcore

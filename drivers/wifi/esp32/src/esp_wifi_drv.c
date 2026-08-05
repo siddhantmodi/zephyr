@@ -28,6 +28,7 @@ LOG_MODULE_REGISTER(esp32_wifi, CONFIG_WIFI_LOG_LEVEL);
 #include <esp_system.h>
 #include <esp_wifi.h>
 #include <esp_wpa.h>
+#include <esp_wifi_sta_pmksa_cache.h>
 #if defined(CONFIG_ESP32_WIFI_ENTERPRISE)
 #include <esp_eap_client.h>
 #endif
@@ -94,6 +95,9 @@ struct esp32_wifi_runtime {
 	uint8_t ap_connection_cnt;
 	struct k_mutex send_lock;
 	struct k_sem tx_done_sem;
+#if defined(CONFIG_WIFI_MGMT_PMKSA_IMPORT)
+	enum wifi_pmksa_cache_usage pmksa_cache_usage;
+#endif
 #if defined(CONFIG_ESP32_WIFI_ENTERPRISE)
 	struct wifi_enterprise_creds_params enterprise_creds;
 #endif
@@ -125,6 +129,48 @@ BUILD_ASSERT(sizeof(mesh_event_disconnected_t) <= ESP32_WIFI_EVENT_DATA_MAX &&
 		     sizeof(mesh_event_toDS_state_t) <= ESP32_WIFI_EVENT_DATA_MAX,
 	     "ESP32_WIFI_EVENT_DATA_MAX is too small for a handled mesh event payload");
 #endif
+
+#if defined(CONFIG_WIFI_MGMT_PMKSA_IMPORT) || defined(CONFIG_WIFI_MGMT_PMKSA_EXPORT)
+BUILD_ASSERT(ESP_WIFI_STA_PMKSA_MAC_LEN == WIFI_MAC_ADDR_LEN,
+	     "ESP32 PMKSA MAC length must match Zephyr");
+BUILD_ASSERT(ESP_WIFI_STA_PMKSA_PMKID_LEN == WIFI_PMKSA_PMKID_LEN,
+	     "ESP32 PMKSA PMKID length must match Zephyr");
+BUILD_ASSERT(ESP_WIFI_STA_PMKSA_PMK_LEN <= WIFI_PMKSA_PMK_MAX_LEN,
+	     "Zephyr PMK buffer must hold the ESP32 PMK");
+BUILD_ASSERT(ESP_WIFI_STA_PMKSA_AKM_802_1X == WIFI_AKM_SUITE_802_1X,
+	     "ESP32 802.1X AKM must match Zephyr");
+BUILD_ASSERT(ESP_WIFI_STA_PMKSA_AKM_802_1X_SHA256 == WIFI_AKM_SUITE_802_1X_SHA256,
+	     "ESP32 802.1X SHA-256 AKM must match Zephyr");
+
+static void esp32_wifi_pmksa_zeroize(void *data, size_t len)
+{
+	volatile uint8_t *bytes = data;
+
+	while (len-- > 0U) {
+		*bytes++ = 0U;
+	}
+}
+#endif /* CONFIG_WIFI_MGMT_PMKSA_IMPORT || CONFIG_WIFI_MGMT_PMKSA_EXPORT */
+
+static int esp32_wifi_pmksa_err_to_errno(esp_err_t err)
+{
+	switch (err) {
+	case ESP_OK:
+		return 0;
+	case ESP_ERR_INVALID_ARG:
+		return -EINVAL;
+	case ESP_ERR_INVALID_STATE:
+		return -EBUSY;
+	case ESP_ERR_NOT_FOUND:
+		return -ENOENT;
+	case ESP_ERR_NOT_SUPPORTED:
+		return -ENOTSUP;
+	case ESP_ERR_NO_MEM:
+		return -ENOMEM;
+	default:
+		return -EIO;
+	}
+}
 
 struct esp32_wifi_event {
 	esp_event_base_t base;
@@ -529,10 +575,25 @@ static void esp_wifi_handle_sta_disconnect_event(void *event_data)
 	}
 	LOG_DBG("Disconnect reason: %d", event->reason);
 
-	if (IS_ENABLED(CONFIG_ESP32_WIFI_STA_RECONNECT) &&
-	    (event->reason != WIFI_REASON_ASSOC_LEAVE)) {
+	bool reconnect = IS_ENABLED(CONFIG_ESP32_WIFI_STA_RECONNECT) &&
+			(event->reason != WIFI_REASON_ASSOC_LEAVE);
+
+#if defined(CONFIG_WIFI_MGMT_PMKSA_IMPORT)
+	if (!reconnect) {
+		(void)esp_wifi_sta_pmksa_cache_clear_external();
+		esp32_data.pmksa_cache_usage = WIFI_PMKSA_CACHE_USAGE_NOT_ATTEMPTED;
+	}
+#endif
+
+	if (reconnect) {
 		esp32_data.state = ESP32_STA_CONNECTING;
-		esp_wifi_connect();
+		if (esp_wifi_connect() != ESP_OK) {
+#if defined(CONFIG_WIFI_MGMT_PMKSA_IMPORT)
+			(void)esp_wifi_sta_pmksa_cache_clear_external();
+			esp32_data.pmksa_cache_usage = WIFI_PMKSA_CACHE_USAGE_NOT_ATTEMPTED;
+#endif
+			esp32_data.state = ESP32_STA_STARTED;
+		}
 	} else {
 		esp32_data.state = ESP32_STA_STARTED;
 	}
@@ -1149,6 +1210,9 @@ static int esp32_wifi_connect(const struct device *dev __unused, struct net_if *
 	struct esp32_wifi_runtime *data = esp32_wifi_data_get(iface);
 	wifi_mode_t mode;
 	int ret;
+#if defined(CONFIG_WIFI_MGMT_PMKSA_IMPORT)
+	esp_wifi_sta_pmksa_cache_entry_t pmksa_entry = { 0 };
+#endif
 
 #if defined(CONFIG_WIFI_ESP32_MESH)
 	/* The mesh stack owns the station link while it runs. */
@@ -1164,10 +1228,48 @@ static int esp32_wifi_connect(const struct device *dev __unused, struct net_if *
 		return -EALREADY;
 	}
 
+#if defined(CONFIG_WIFI_MGMT_PMKSA_IMPORT)
+	if (params->pmksa_entry_count > 1U) {
+		ret = -ENOSPC;
+		goto out;
+	}
+
+	if (params->pmksa_entry_count == 1U) {
+		const struct wifi_pmksa_cache_entry *entry = params->pmksa_entries;
+
+		if (entry == NULL ||
+		    (entry->akm != WIFI_AKM_SUITE_802_1X &&
+		     entry->akm != WIFI_AKM_SUITE_802_1X_SHA256) ||
+		    entry->pmk_len != ESP_WIFI_STA_PMKSA_PMK_LEN ||
+		    entry->fils_cache_id_set || entry->opportunistic ||
+		    entry->expiration_remaining_s == 0U ||
+		    entry->expiration_remaining_s > ESP_WIFI_STA_PMKSA_MAX_LIFETIME_S ||
+		    entry->reauth_remaining_s > entry->expiration_remaining_s) {
+			ret = -EPROTONOSUPPORT;
+			goto out;
+		}
+
+		if (memcmp(entry->spa, data->mac_addr, WIFI_MAC_ADDR_LEN) != 0) {
+			ret = -EINVAL;
+			goto out;
+		}
+
+		memcpy(pmksa_entry.bssid, entry->bssid, sizeof(pmksa_entry.bssid));
+		memcpy(pmksa_entry.sta_addr, entry->spa, sizeof(pmksa_entry.sta_addr));
+		memcpy(pmksa_entry.pmkid, entry->pmkid, sizeof(pmksa_entry.pmkid));
+		memcpy(pmksa_entry.pmk, entry->pmk, sizeof(pmksa_entry.pmk));
+		pmksa_entry.pmk_len = entry->pmk_len;
+		pmksa_entry.akm_suite = entry->akm;
+		pmksa_entry.reauth_remaining_s = entry->reauth_remaining_s;
+		pmksa_entry.expiration_remaining_s = entry->expiration_remaining_s;
+	}
+#endif
+
 	ret = esp_wifi_get_mode(&mode);
 	if (ret) {
 		LOG_ERR("Failed to get Wi-Fi mode (%d)", ret);
-		return -EAGAIN;
+		ret = -EAGAIN;
+		goto out;
 	}
 
 	if (IS_ENABLED(CONFIG_ESP32_WIFI_AP_STA_MODE) &&
@@ -1179,7 +1281,8 @@ static int esp32_wifi_connect(const struct device *dev __unused, struct net_if *
 
 	if (ret) {
 		LOG_ERR("Failed to set Wi-Fi mode (%d)", ret);
-		return -EAGAIN;
+		ret = -EAGAIN;
+		goto out;
 	}
 
 	k_sem_reset(&esp32_sta_started_sem);
@@ -1187,7 +1290,8 @@ static int esp32_wifi_connect(const struct device *dev __unused, struct net_if *
 	ret = esp32_wifi_start();
 	if (ret) {
 		LOG_ERR("Failed to start Wi-Fi driver (%d)", ret);
-		return -EAGAIN;
+		ret = -EAGAIN;
+		goto out;
 	}
 
 	if (data->state != ESP32_STA_STARTED) {
@@ -1197,7 +1301,8 @@ static int esp32_wifi_connect(const struct device *dev __unused, struct net_if *
 		if (data->state != ESP32_STA_STARTED) {
 			LOG_ERR("Wi-Fi not in station mode");
 			wifi_mgmt_raise_connect_result_event(iface, WIFI_STATUS_CONN_FAIL);
-			return -EIO;
+			ret = -EIO;
+			goto out;
 		}
 	}
 
@@ -1219,7 +1324,8 @@ static int esp32_wifi_connect(const struct device *dev __unused, struct net_if *
 		if (ret != ESP_OK) {
 			LOG_ERR("Failed to disable Enterprise authentication (%d)", ret);
 			data->state = ESP32_STA_STARTED;
-			return -EIO;
+			ret = -EIO;
+			goto out;
 		}
 	}
 #endif
@@ -1285,7 +1391,8 @@ static int esp32_wifi_connect(const struct device *dev __unused, struct net_if *
 		LOG_ERR("WPA3 not supported for STA mode. Enable "
 			"CONFIG_ESP32_WIFI_ENABLE_WPA3_SAE");
 		data->state = ESP32_STA_STARTED;
-		return -EINVAL;
+		ret = -EINVAL;
+		goto out;
 #endif /* CONFIG_ESP32_WIFI_ENABLE_WPA3_SAE */
 	case WIFI_SECURITY_TYPE_EAP_TLS:
 	case WIFI_SECURITY_TYPE_EAP_PEAP_MSCHAPV2:
@@ -1296,19 +1403,21 @@ static int esp32_wifi_connect(const struct device *dev __unused, struct net_if *
 		ret = esp32_wifi_configure_enterprise(data, params, &wifi_config);
 		if (ret) {
 			data->state = ESP32_STA_STARTED;
-			return ret;
+			goto out;
 		}
 		break;
 #else
 		LOG_ERR("WPA Enterprise not supported for STA mode. Enable "
 			"CONFIG_ESP32_WIFI_ENTERPRISE");
 		data->state = ESP32_STA_STARTED;
-		return -EINVAL;
+		ret = -EINVAL;
+		goto out;
 #endif /* CONFIG_ESP32_WIFI_ENTERPRISE */
 	default:
 		LOG_ERR("Authentication method not supported");
 		data->state = ESP32_STA_STARTED;
-		return -EIO;
+		ret = -EIO;
+		goto out;
 	}
 
 #if defined(CONFIG_ESP32_WIFI_STA_SCAN_ALL)
@@ -1323,17 +1432,41 @@ static int esp32_wifi_connect(const struct device *dev __unused, struct net_if *
 	if (ret) {
 		LOG_ERR("Failed to set Wi-Fi configuration (%d)", ret);
 		data->state = ESP32_STA_STARTED;
-		return -EINVAL;
+		ret = -EINVAL;
+		goto out;
 	}
+
+#if defined(CONFIG_WIFI_MGMT_PMKSA_IMPORT)
+	if (params->pmksa_entry_count == 0U) {
+		ret = esp32_wifi_pmksa_err_to_errno(esp_wifi_sta_pmksa_cache_clear_external());
+	} else {
+		ret = esp32_wifi_pmksa_err_to_errno(esp_wifi_sta_pmksa_cache_stage(&pmksa_entry));
+	}
+	if (ret != 0) {
+		LOG_ERR("Failed to prepare PMKSA cache (%d)", ret);
+		data->state = ESP32_STA_STARTED;
+		goto out;
+	}
+	data->pmksa_cache_usage = params->pmksa_entry_count == 0U ?
+		WIFI_PMKSA_CACHE_USAGE_NOT_ATTEMPTED : WIFI_PMKSA_CACHE_USAGE_UNKNOWN;
+#endif
 
 	ret = esp_wifi_connect();
 	if (ret) {
 		LOG_ERR("Failed to connect to Wi-Fi access point (%d)", ret);
+	#if defined(CONFIG_WIFI_MGMT_PMKSA_IMPORT)
+		(void)esp_wifi_sta_pmksa_cache_clear_external();
+		data->pmksa_cache_usage = WIFI_PMKSA_CACHE_USAGE_NOT_ATTEMPTED;
+	#endif
 		data->state = ESP32_STA_STARTED;
-		return -EAGAIN;
+		ret = -EAGAIN;
 	}
 
-	return 0;
+out:
+#if defined(CONFIG_WIFI_MGMT_PMKSA_IMPORT)
+	esp32_wifi_pmksa_zeroize(&pmksa_entry, sizeof(pmksa_entry));
+#endif
+	return ret;
 }
 
 static int esp32_wifi_scan(const struct device *dev __unused,
@@ -1584,6 +1717,10 @@ static int esp32_wifi_status(const struct device *dev __unused,
 	wifi_mode_t mode;
 	wifi_config_t conf;
 	wifi_ap_record_t ap_info;
+
+#if defined(CONFIG_WIFI_MGMT_PMKSA_IMPORT)
+	status->pmksa_cache_usage = data->pmksa_cache_usage;
+#endif
 
 	switch (data->state) {
 	case ESP32_STA_STOPPED:
@@ -1902,6 +2039,84 @@ static int esp32_wifi_set_config(const struct device *dev __unused,
 	return -ENOTSUP;
 }
 
+#if defined(CONFIG_WIFI_MGMT_PMKSA_EXPORT)
+static int esp32_wifi_pmksa_get(const struct device *dev __unused, struct net_if *iface,
+				struct wifi_pmksa_cache_query *query)
+{
+	esp_wifi_sta_pmksa_cache_entry_t hal_entry = { 0 };
+	esp_err_t err;
+	int ret;
+
+	if (iface != esp32_wifi_iface) {
+		ret = -ENOTSUP;
+		goto out;
+	}
+	if (query->index != 0U) {
+		ret = -ENOENT;
+		goto out;
+	}
+	if (esp32_data.state != ESP32_STA_CONNECTED) {
+		ret = -ENOTCONN;
+		goto out;
+	}
+
+	err = esp_wifi_sta_pmksa_cache_export(&hal_entry);
+	ret = esp32_wifi_pmksa_err_to_errno(err);
+	if (ret != 0) {
+		goto out;
+	}
+
+	if (memcmp(hal_entry.sta_addr, esp32_data.mac_addr, WIFI_MAC_ADDR_LEN) != 0) {
+		ret = -EIO;
+		goto out;
+	}
+
+	memcpy(query->entry.bssid, hal_entry.bssid, sizeof(hal_entry.bssid));
+	memcpy(query->entry.spa, hal_entry.sta_addr, sizeof(hal_entry.sta_addr));
+	memcpy(query->entry.pmkid, hal_entry.pmkid, sizeof(hal_entry.pmkid));
+	memcpy(query->entry.pmk, hal_entry.pmk, sizeof(hal_entry.pmk));
+	query->entry.pmk_len = hal_entry.pmk_len;
+	query->entry.akm = (enum wifi_akm_suite)hal_entry.akm_suite;
+	query->entry.reauth_remaining_s = hal_entry.reauth_remaining_s;
+	query->entry.expiration_remaining_s = hal_entry.expiration_remaining_s;
+	query->entry_count = 1U;
+	ret = 0;
+
+out:
+	esp32_wifi_pmksa_zeroize(&hal_entry, sizeof(hal_entry));
+	return ret;
+}
+#endif /* CONFIG_WIFI_MGMT_PMKSA_EXPORT */
+
+#if defined(CONFIG_WIFI_MGMT_PMKSA_IMPORT)
+static int esp32_wifi_pmksa_flush_external(const struct device *dev __unused,
+					   struct net_if *iface)
+{
+	if (iface != esp32_wifi_iface) {
+		return -ENOTSUP;
+	}
+	if (esp32_data.state != ESP32_STA_STOPPED &&
+	    esp32_data.state != ESP32_STA_STARTED) {
+		return -EBUSY;
+	}
+
+	return esp32_wifi_pmksa_err_to_errno(esp_wifi_sta_pmksa_cache_clear_external());
+}
+#endif /* CONFIG_WIFI_MGMT_PMKSA_IMPORT */
+
+static int esp32_wifi_pmksa_flush(const struct device *dev __unused, struct net_if *iface)
+{
+	if (iface != esp32_wifi_iface) {
+		return -ENOTSUP;
+	}
+	if (esp32_data.state != ESP32_STA_STOPPED &&
+	    esp32_data.state != ESP32_STA_STARTED) {
+		return -EBUSY;
+	}
+
+	return esp32_wifi_pmksa_err_to_errno(esp_wifi_sta_pmksa_cache_clear());
+}
+
 static const struct wifi_mgmt_ops esp32_wifi_mgmt = {
 	.scan = esp32_wifi_scan,
 	.connect = esp32_wifi_connect,
@@ -1910,6 +2125,13 @@ static const struct wifi_mgmt_ops esp32_wifi_mgmt = {
 	.ap_disable = esp32_wifi_ap_disable,
 	.iface_status = esp32_wifi_status,
 	.set_power_save = esp32_wifi_set_power_save,
+	.pmksa_flush = esp32_wifi_pmksa_flush,
+#if defined(CONFIG_WIFI_MGMT_PMKSA_EXPORT)
+	.pmksa_get = esp32_wifi_pmksa_get,
+#endif
+#if defined(CONFIG_WIFI_MGMT_PMKSA_IMPORT)
+	.pmksa_flush_external = esp32_wifi_pmksa_flush_external,
+#endif
 #if defined(CONFIG_ESP32_WIFI_ENTERPRISE)
 	.enterprise_creds = esp32_wifi_enterprise_creds,
 #endif
