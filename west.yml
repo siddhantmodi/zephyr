@@ -172,7 +172,8 @@ manifest:
       groups:
         - hal
     - name: hal_espressif
-      revision: refs/pull/624/head
+      url: https://github.com/siddhantmodi/hal_espressif
+      revision: feature/pmksa_cache_multi_record
       path: modules/hal/espressif
       west-commands: west/west-commands.yml
       groups:
