@@ -1297,7 +1297,8 @@ static void esp32_wifi_pmksa_batch_add(esp_wifi_sta_pmksa_cache_entry_t *batch, 
 static int esp32_wifi_pmksa_prepare(const struct wifi_connect_req_params *params,
 				    const uint8_t *sta_addr)
 {
-	esp_wifi_sta_pmksa_cache_entry_t batch[ESP_WIFI_STA_PMKSA_MAX_ENTRIES] = {0};
+	/* Kept off the caller's stack; connect handles one request at a time. */
+	static esp_wifi_sta_pmksa_cache_entry_t batch[ESP_WIFI_STA_PMKSA_MAX_ENTRIES];
 	size_t batch_count = 0U;
 	size_t staged_count = 0U;
 	esp_err_t err;
