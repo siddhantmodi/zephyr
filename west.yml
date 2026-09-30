@@ -172,7 +172,8 @@ manifest:
       groups:
         - hal
     - name: hal_espressif
-      revision: refs/pull/624/head
+      url: https://github.com/siddhantmodi/hal_espressif
+      revision: 01c6a458719d52d90090b230f6009e375cc08626
       path: modules/hal/espressif
       west-commands: west/west-commands.yml
       groups:
